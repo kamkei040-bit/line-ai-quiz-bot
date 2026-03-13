@@ -1,110 +1,81 @@
 import os
 import json
+import random
 import hmac
 import hashlib
 import base64
-import random
-from typing import Dict, Any
-
 import requests
 from flask import Flask, request, abort
 
 app = Flask(__name__)
 
+# 環境変数
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
-if not LINE_CHANNEL_ACCESS_TOKEN:
-    raise ValueError("環境変数 LINE_CHANNEL_ACCESS_TOKEN が未設定です。")
-
-if not LINE_CHANNEL_SECRET:
-    raise ValueError("環境変数 LINE_CHANNEL_SECRET が未設定です。")
-
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
-# ユーザーごとの出題状態を一時保存
-USER_STATE: Dict[str, Dict[str, Any]] = {}
-
-# 問題データ
+# クイズ問題
 QUIZ_DATA = [
     {
         "question": "AIがもっともらしい誤情報を生成する現象は？",
-        "choices": ["ハルシネーション", "プロンプト", "トークン", "DX"],
-        "answer_index": 0,
-        "explanation": "ハルシネーションは、AIが事実ではない内容をもっともらしく生成する現象です。"
+        "choices": ["ハルシネーション", "DX", "API", "IoT"],
+        "answer": 0,
+        "explanation": "ハルシネーションはAIが事実ではない内容を生成する現象です。"
     },
     {
-        "question": "AIへの指示文のことは？",
-        "choices": ["バイアス", "プロンプト", "AGI", "著作権"],
-        "answer_index": 1,
-        "explanation": "プロンプトは、AIに対して与える指示文です。"
+        "question": "AIへの指示文を何と呼ぶ？",
+        "choices": ["トークン", "プロンプト", "GPU", "API"],
+        "answer": 1,
+        "explanation": "プロンプトはAIへの指示文です。"
     },
     {
-        "question": "大量の文章データで学習した大規模言語モデルは？",
-        "choices": ["OCR", "CPU", "LLM", "DX"],
-        "answer_index": 2,
-        "explanation": "LLM は Large Language Model の略で、大規模言語モデルです。"
+        "question": "Large Language Model の略は？",
+        "choices": ["LLM", "CPU", "OCR", "SNS"],
+        "answer": 0,
+        "explanation": "LLMは大規模言語モデルのことです。"
     },
     {
-        "question": "データの偏りによってAIの結果が偏ることを何という？",
-        "choices": ["自動化", "バイアス", "透明性", "著作権"],
-        "answer_index": 1,
-        "explanation": "バイアスは、データや判断の偏りのことです。"
+        "question": "データの偏りで結果が偏る問題は？",
+        "choices": ["DX", "バイアス", "OCR", "API"],
+        "answer": 1,
+        "explanation": "AIの判断が偏る原因になります。"
     },
     {
-        "question": "創作物を守る法律上の権利は？",
-        "choices": ["個人情報", "著作権", "機密情報", "プライバシー"],
-        "answer_index": 1,
-        "explanation": "著作権は、文章・画像・音楽などの創作物を守る権利です。"
-    },
-    {
-        "question": "AIの判断過程が説明しやすいことを何という？",
-        "choices": ["透明性", "自動化", "規制", "学習率"],
-        "answer_index": 0,
-        "explanation": "透明性は、AIの判断や動作が分かりやすく説明できることです。"
-    },
-    {
-        "question": "文章や画像などを新しく作り出すAIを何という？",
-        "choices": ["検索AI", "生成AI", "監視AI", "認証AI"],
-        "answer_index": 1,
-        "explanation": "生成AIは、文章・画像・音声などを新しく生成するAIです。"
-    },
-    {
-        "question": "AIの安全な利用や管理のためのルール整備を何という？",
-        "choices": ["AIガバナンス", "プロンプト", "トークン化", "レンダリング"],
-        "answer_index": 0,
-        "explanation": "AIガバナンスは、AIを安全かつ適切に運用するための管理や統制です。"
-    },
-    {
-        "question": "個人を特定できる情報を何という？",
-        "choices": ["機密情報", "個人情報", "著作物", "公開情報"],
-        "answer_index": 1,
-        "explanation": "個人情報は、氏名や住所など個人を特定できる情報です。"
-    },
-    {
-        "question": "業務をデジタル技術で変革することを何という？",
-        "choices": ["API", "DX", "GPU", "OCR"],
-        "answer_index": 1,
-        "explanation": "DX は Digital Transformation の略で、デジタル技術による業務変革です。"
+        "question": "創作物を守る権利は？",
+        "choices": ["個人情報", "著作権", "DX", "API"],
+        "answer": 1,
+        "explanation": "著作権は創作物を守る権利です。"
     }
 ]
 
+USER_STATE = {}
 
-def verify_signature(request_body: bytes, signature: str) -> bool:
-    digest = hmac.new(
-        LINE_CHANNEL_SECRET.encode("utf-8"),
-        request_body,
+# ---------------------------
+# 署名検証
+# ---------------------------
+def verify_signature(body, signature):
+
+    hash = hmac.new(
+        LINE_CHANNEL_SECRET.encode('utf-8'),
+        body,
         hashlib.sha256
     ).digest()
-    computed_signature = base64.b64encode(digest).decode("utf-8")
-    return hmac.compare_digest(computed_signature, signature)
 
+    expected_signature = base64.b64encode(hash).decode()
 
-def reply_message(reply_token: str, text: str) -> None:
+    return hmac.compare_digest(expected_signature, signature)
+
+# ---------------------------
+# LINE返信
+# ---------------------------
+def reply_message(reply_token, text):
+
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
     }
+
     payload = {
         "replyToken": reply_token,
         "messages": [
@@ -115,126 +86,147 @@ def reply_message(reply_token: str, text: str) -> None:
         ]
     }
 
-    response = requests.post(
+    requests.post(
         LINE_REPLY_URL,
         headers=headers,
-        data=json.dumps(payload),
-        timeout=10
+        data=json.dumps(payload)
     )
-    print("LINE reply status:", response.status_code)
-    print("LINE reply body:", response.text)
 
+# ---------------------------
+# クイズ出題
+# ---------------------------
+def start_quiz(user_id):
 
-def build_quiz_text(quiz: Dict[str, Any]) -> str:
-    lines = [
-        "【AI用語クイズ】",
-        "",
-        quiz["question"],
-        ""
-    ]
-
-    for i, choice in enumerate(quiz["choices"], start=1):
-        lines.append(f"{i}. {choice}")
-
-    lines.extend([
-        "",
-        "1〜4の数字で答えてください。"
-    ])
-    return "\n".join(lines)
-
-
-def start_quiz_for_user(user_id: str) -> str:
     quiz = random.choice(QUIZ_DATA)
-    USER_STATE[user_id] = {
-        "quiz": quiz
-    }
-    return build_quiz_text(quiz)
 
+    USER_STATE[user_id] = quiz
 
-def check_answer(user_id: str, user_text: str) -> str:
-    state = USER_STATE.get(user_id)
-    if not state:
-        return "先に「AIテスト」と送ってください。"
+    text = f"""【AIクイズ】
 
-    quiz = state["quiz"]
+{quiz["question"]}
+
+1. {quiz["choices"][0]}
+2. {quiz["choices"][1]}
+3. {quiz["choices"][2]}
+4. {quiz["choices"][3]}
+
+数字で答えてください。
+"""
+
+    return text
+
+# ---------------------------
+# 回答判定
+# ---------------------------
+def check_answer(user_id, text):
+
+    if user_id not in USER_STATE:
+        return "先に『AIテスト』と送ってください。"
+
+    quiz = USER_STATE[user_id]
 
     try:
-        selected_index = int(user_text) - 1
-    except ValueError:
-        return "1〜4の数字で答えてください。"
+        answer = int(text) - 1
+    except:
+        return "1〜4で答えてください。"
 
-    correct_index = quiz["answer_index"]
+    correct = quiz["answer"]
 
-    if selected_index == correct_index:
-        result = (
-            "⭕ 正解です！\n\n"
-            f"正解：{quiz['choices'][correct_index]}\n"
-            f"{quiz['explanation']}\n\n"
-            "次の問題は\nAIテスト\nと送ってください。"
-        )
+    if answer == correct:
+
+        msg = f"""⭕ 正解！
+
+{quiz["explanation"]}
+
+次の問題は
+AIテスト
+と送ってください。
+"""
+
     else:
-        result = (
-            "❌ 不正解です。\n\n"
-            f"正解：{correct_index + 1}. {quiz['choices'][correct_index]}\n"
-            f"{quiz['explanation']}\n\n"
-            "次の問題は\nAIテスト\nと送ってください。"
-        )
+
+        msg = f"""❌ 不正解
+
+正解
+{correct+1}. {quiz["choices"][correct]}
+
+{quiz["explanation"]}
+
+次の問題は
+AIテスト
+と送ってください。
+"""
 
     USER_STATE.pop(user_id, None)
-    return result
 
+    return msg
 
+# ---------------------------
+# 動作確認
+# ---------------------------
 @app.route("/", methods=["GET"])
 def home():
-    return "LINE AI Quiz Bot is running!", 200
+    return "LINE BOT RUNNING", 200
 
-
+# ---------------------------
+# LINE Webhook
+# ---------------------------
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature", "")
+
+    signature = request.headers.get('X-Line-Signature')
     body = request.get_data()
 
     if not verify_signature(body, signature):
         abort(400)
 
-    payload = request.get_json(silent=True)
-    if not payload:
-        return "OK", 200
+    data = json.loads(body)
 
-    for event in payload.get("events", []):
-        if event.get("type") != "message":
+    for event in data["events"]:
+
+        if event["type"] != "message":
             continue
 
-        message = event.get("message", {})
-        if message.get("type") != "text":
+        if event["message"]["type"] != "text":
             continue
 
-        reply_token = event.get("replyToken")
-        user_text = message.get("text", "").strip()
-        user_id = event.get("source", {}).get("userId", "unknown")
+        reply_token = event["replyToken"]
+        user_id = event["source"]["userId"]
+        text = event["message"]["text"]
 
-        if user_text == "AIテスト":
-            text = start_quiz_for_user(user_id)
-            reply_message(reply_token, text)
-            continue
+        # クイズ開始
+        if text == "AIテスト":
 
-        if user_text in ["1", "2", "3", "4"]:
-            text = check_answer(user_id, user_text)
-            reply_message(reply_token, text)
-            continue
+            msg = start_quiz(user_id)
 
-        help_text = (
-            "使い方\n\n"
-            "AIテスト\n"
-            "→ AI用語クイズを1問出します\n\n"
-            "1〜4\n"
-            "→ 答えます"
-        )
-        reply_message(reply_token, help_text)
+            reply_message(reply_token, msg)
 
-    return "OK", 200
+        # 回答
+        elif text in ["1","2","3","4"]:
 
+            msg = check_answer(user_id, text)
 
+            reply_message(reply_token, msg)
+
+        else:
+
+            msg = """使い方
+
+AIテスト
+→ AIクイズ開始
+
+1〜4
+→ 回答"""
+
+            reply_message(reply_token, msg)
+
+    return "OK"
+
+# ---------------------------
+# Render用
+# ---------------------------
 if __name__ == "__main__":
+
     port = int(os.environ.get("PORT", 10000))
+
     app.run(host="0.0.0.0", port=port)
