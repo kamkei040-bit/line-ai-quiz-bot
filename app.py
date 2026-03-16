@@ -1,6 +1,7 @@
 from flask import Flask, request, abort
 import os
 import random
+import pandas as pd
 
 from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
@@ -20,12 +21,16 @@ CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
+EXCEL_FILE = "ai_quiz_dataset.xlsx"
+EXCEL_SHEET_NAME = "Questions"
+
 # ----------------------------
-# 問題データ
+# 予備の問題データ
+# Excelがまだ無い時でも最低限動作するように残す
 # answer は 1〜4
 # category は分野名
 # ----------------------------
-QUIZ_DATA = [
+FALLBACK_QUIZ_DATA = [
     {
         "category": "用語",
         "question": "AIとは何の略ですか？",
@@ -148,7 +153,100 @@ QUIZ_DATA = [
     },
 ]
 
-CATEGORIES = ["用語", "機械学習", "生成AI", "法律倫理", "セキュリティ"]
+
+def normalize_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def normalize_answer(value):
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip().upper()
+
+    answer_map = {
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "A": 1,
+        "B": 2,
+        "C": 3,
+        "D": 4,
+    }
+    return answer_map.get(text)
+
+
+def load_quiz_data_from_excel(file_path=EXCEL_FILE, sheet_name=EXCEL_SHEET_NAME):
+    if not os.path.exists(file_path):
+        print(f"[INFO] Excel file not found: {file_path}. Fallback data will be used.")
+        return None
+
+    try:
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_name)
+        except Exception:
+            # シート名が違う場合は先頭シートを読む
+            df = pd.read_excel(file_path)
+
+        required_cols = ["Question", "A", "B", "C", "D", "Answer"]
+        for col in required_cols:
+            if col not in df.columns:
+                raise ValueError(f"Excelに必要な列 {col} がありません。")
+
+        quiz_list = []
+        for _, row in df.iterrows():
+            question = normalize_text(row.get("Question"))
+            choice_a = normalize_text(row.get("A"))
+            choice_b = normalize_text(row.get("B"))
+            choice_c = normalize_text(row.get("C"))
+            choice_d = normalize_text(row.get("D"))
+            answer = normalize_answer(row.get("Answer"))
+
+            if not question or not choice_a or not choice_b or not choice_c or not choice_d or answer is None:
+                continue
+
+            explanation = normalize_text(row.get("Explanation"))
+            category = normalize_text(row.get("Category")) or "未分類"
+
+            quiz_list.append({
+                "category": category,
+                "question": question,
+                "choices": [choice_a, choice_b, choice_c, choice_d],
+                "answer": answer,
+                "explanation": explanation if explanation else "解説は準備中です。"
+            })
+
+        if not quiz_list:
+            print("[WARN] Excel was loaded, but no valid quiz rows were found. Fallback data will be used.")
+            return None
+
+        print(f"[INFO] Loaded {len(quiz_list)} quizzes from Excel.")
+        return quiz_list
+
+    except Exception as e:
+        print(f"[ERROR] Failed to load Excel: {e}")
+        return None
+
+
+def get_quiz_data():
+    excel_data = load_quiz_data_from_excel()
+    if excel_data:
+        return excel_data
+    return FALLBACK_QUIZ_DATA
+
+
+QUIZ_DATA = get_quiz_data()
+
+
+def get_categories():
+    categories = sorted(list(set(q["category"] for q in QUIZ_DATA if q.get("category"))))
+    return categories
+
+
+CATEGORIES = get_categories()
 
 # ユーザーごとの状態
 user_state = {}
@@ -162,6 +260,7 @@ user_state = {}
 #   "total": 10
 # }
 
+
 def build_quiz_text(quiz, prefix="【AIパスポート問題】"):
     return (
         f"{prefix}\n"
@@ -174,15 +273,21 @@ def build_quiz_text(quiz, prefix="【AIパスポート問題】"):
         f"答えは 1〜4 で送ってください。"
     )
 
+
 def pick_one_quiz(category=None, exclude_questions=None):
     pool = QUIZ_DATA
+
     if category:
         pool = [q for q in pool if q["category"] == category]
+
     if exclude_questions:
         pool = [q for q in pool if q["question"] not in exclude_questions]
+
     if not pool:
         return None
+
     return random.choice(pool)
+
 
 def start_single_quiz(user_id, category=None):
     quiz = pick_one_quiz(category=category)
@@ -200,6 +305,7 @@ def start_single_quiz(user_id, category=None):
 
     prefix = "【AIパスポート1問】"
     return build_quiz_text(quiz, prefix=prefix)
+
 
 def start_test_quiz(user_id, category=None, total=10):
     pool = QUIZ_DATA if category is None else [q for q in QUIZ_DATA if q["category"] == category]
@@ -226,9 +332,10 @@ def start_test_quiz(user_id, category=None, total=10):
     prefix = f"【AIパスポート {total}問テスト開始】{category_text}\n1/{total}問目"
     return build_quiz_text(first_quiz, prefix=prefix)
 
+
 def handle_answer(user_id, answer_text):
     if user_id not in user_state:
-        return "先に「クイズ」または「10問」と送ってください。"
+        return "先に「AI試験」または「クイズ」と送ってください。"
 
     state = user_state[user_id]
     quiz = state["current_quiz"]
@@ -250,7 +357,6 @@ def handle_answer(user_id, answer_text):
         del user_state[user_id]
         return result_text + "\n\n次の問題をやるなら「クイズ」と送ってください。"
 
-    # test mode
     answered_count = state["total"] - len(state["remaining"])
 
     if state["remaining"]:
@@ -269,38 +375,52 @@ def handle_answer(user_id, answer_text):
             f"{next_text}"
         )
     else:
+        score = state["correct"]
+        total = state["total"]
+        percentage = int((score / total) * 100) if total > 0 else 0
+
         score_text = (
             f"{result_text}\n\n"
             f"【テスト終了】\n"
-            f"正解数：{state['correct']} / {state['total']}"
+            f"正解数：{score} / {total}\n"
+            f"得点：{percentage}点"
         )
 
-        if state["correct"] == state["total"]:
+        if score == total:
             score_text += "\n素晴らしいです！満点です。"
-        elif state["correct"] >= max(1, int(state["total"] * 0.8)):
+        elif score >= max(1, int(total * 0.8)):
             score_text += "\nかなり仕上がっています。"
-        elif state["correct"] >= max(1, int(state["total"] * 0.6)):
+        elif score >= max(1, int(total * 0.6)):
             score_text += "\n順調です。復習するとさらに安定します。"
         else:
             score_text += "\n基礎用語の復習から固めるのがおすすめです。"
 
         del user_state[user_id]
-        return score_text + "\n\nもう一度やるなら「10問」と送ってください。"
+        return score_text + "\n\nもう一度やるなら「AI試験」と送ってください。"
+
 
 def help_text():
+    category_list = " / ".join(CATEGORIES) if CATEGORIES else "未登録"
+
     return (
         "【使い方】\n"
+        "・AI試験 → ランダム10問テスト\n"
+        "・10問 → ランダム10問テスト\n"
         "・クイズ → ランダムで1問\n"
-        "・10問 → ランダムで10問テスト\n"
-        "・用語 / 機械学習 / 生成AI / 法律倫理 / セキュリティ → 分野別1問\n"
-        "・用語10問 / 機械学習10問 など → 分野別テスト\n"
+        "・1問 → ランダムで1問\n"
+        "・分野名 → その分野を1問\n"
+        "・分野名+10問 → その分野で10問テスト\n"
         "・1 / 2 / 3 / 4 → 回答\n"
-        "・ヘルプ → 使い方表示"
+        "・終了 → 途中のテストを中止\n"
+        "・ヘルプ → 使い方表示\n\n"
+        f"【現在の分野】\n{category_list}"
     )
+
 
 @app.route("/")
 def home():
     return "LINE BOT OK"
+
 
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -315,19 +435,34 @@ def callback():
 
     return "OK"
 
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
+    global QUIZ_DATA, CATEGORIES
+
     user_id = event.source.user_id
     user_text = event.message.text.strip()
+
+    # 毎回最新のExcelを読み直したい場合はここで再読込
+    # 問題数が500程度なら実用範囲
+    QUIZ_DATA = get_quiz_data()
+    CATEGORIES = get_categories()
 
     if user_text in ["1", "2", "3", "4"]:
         reply_text = handle_answer(user_id, user_text)
 
+    elif user_text in ["AI試験", "10問"]:
+        reply_text = start_test_quiz(user_id, total=10)
+
     elif user_text in ["クイズ", "1問"]:
         reply_text = start_single_quiz(user_id)
 
-    elif user_text == "10問":
-        reply_text = start_test_quiz(user_id, total=10)
+    elif user_text in ["終了", "中止", "やめる", "キャンセル"]:
+        if user_id in user_state:
+            del user_state[user_id]
+            reply_text = "現在のテストを終了しました。もう一度始めるなら「AI試験」と送ってください。"
+        else:
+            reply_text = "現在進行中のテストはありません。"
 
     elif user_text in CATEGORIES:
         reply_text = start_single_quiz(user_id, category=user_text)
@@ -345,7 +480,7 @@ def handle_message(event):
     else:
         reply_text = (
             "AIパスポート試験対策BOTです。\n"
-            "「クイズ」「10問」「ヘルプ」と送ってください。"
+            "「AI試験」「クイズ」「ヘルプ」と送ってください。"
         )
 
     with ApiClient(configuration) as api_client:
@@ -357,5 +492,6 @@ def handle_message(event):
             )
         )
 
+
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=10000)
