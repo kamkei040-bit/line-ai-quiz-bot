@@ -25,6 +25,12 @@ if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
+# -----------------------------------
+# ユーザーごとの出題状態をメモリ上で保持
+# ※ Render再起動などで消えます
+# -----------------------------------
+user_sessions = {}
+
 
 def send_reply(reply_token, text):
     with ApiClient(configuration) as api_client:
@@ -37,12 +43,27 @@ def send_reply(reply_token, text):
         )
 
 
-def format_quiz(quiz):
+def get_user_id(event):
+    # user / group / room いずれでも source 内に user_id があれば優先
+    source = event.source
+    if hasattr(source, "user_id") and source.user_id:
+        return source.user_id
+
+    # 念のため fallback
+    return "unknown_user"
+
+
+def format_quiz(quiz, number=None):
     choices_text = "\n".join(
         [f"{i + 1}. {choice}" for i, choice in enumerate(quiz["choices"])]
     )
+
+    header = "【AIパスポート問題】"
+    if number is not None:
+        header = f"【AIパスポート問題 第{number}問】"
+
     return (
-        f"【AIパスポート問題】\n"
+        f"{header}\n"
         f"分野：{quiz['category']}\n\n"
         f"{quiz['question']}\n\n"
         f"{choices_text}\n\n"
@@ -50,14 +71,51 @@ def format_quiz(quiz):
     )
 
 
-def format_answer(quiz):
+def format_result_message(quiz, user_answer):
     correct_number = quiz["answer"]
     correct_text = quiz["choices"][correct_number - 1]
+
+    if user_answer == correct_number:
+        judge = "⭕ 正解です！"
+    else:
+        judge = f"❌ 不正解です。\nあなたの回答：{user_answer}. {quiz['choices'][user_answer - 1]}"
+
     return (
+        f"{judge}\n\n"
         f"【正解】\n"
         f"{correct_number}. {correct_text}\n\n"
         f"【解説】\n"
         f"{quiz['explanation']}"
+    )
+
+
+def start_new_quiz_for_user(user_id):
+    quiz = random.choice(QUIZ_DATA)
+
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {
+            "current_quiz": None,
+            "question_count": 0,
+            "correct_count": 0,
+        }
+
+    user_sessions[user_id]["current_quiz"] = quiz
+    user_sessions[user_id]["question_count"] += 1
+
+    return quiz, user_sessions[user_id]["question_count"]
+
+
+def get_help_message():
+    return (
+        "AIパスポート問題botです。\n\n"
+        "【使い方】\n"
+        "・「問題」→ 1問出題\n"
+        "・「次」→ 次の問題を出題\n"
+        "・「1」「2」「3」「4」→ 回答\n"
+        "・「スコア」→ 現在の正答数を表示\n"
+        "・「リセット」→ 成績をリセット\n"
+        "・「ヘルプ」→ この説明を表示\n\n"
+        "まずは「問題」と送ってください。"
     )
 
 
@@ -83,37 +141,103 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_text = event.message.text.strip()
-
-    # 小文字化して判定しやすくする
     normalized = user_text.lower()
+    user_id = get_user_id(event)
 
+    # セッション未作成なら初期化
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {
+            "current_quiz": None,
+            "question_count": 0,
+            "correct_count": 0,
+        }
+
+    session = user_sessions[user_id]
+
+    # ----------------------------
+    # 問題出題
+    # ----------------------------
     if normalized in ["問題", "もんだい", "quiz", "q", "次", "つぎ", "next"]:
-        quiz = random.choice(QUIZ_DATA)
-        message = format_quiz(quiz)
-        send_reply(event.reply_token, message)
+        quiz, number = start_new_quiz_for_user(user_id)
+        send_reply(event.reply_token, format_quiz(quiz, number))
         return
 
-    # 1〜4 の入力で、ランダムに解答解説を返す簡易版
-    # ※現状は「直前の問題を記憶する機能」は入れていません
+    # ----------------------------
+    # 回答処理
+    # ----------------------------
     if user_text in ["1", "2", "3", "4"]:
-        quiz = random.choice(QUIZ_DATA)
-        message = (
-            "※この版は整理版のため、回答番号に対してランダム問題の解説を返す簡易構成です。\n\n"
-            + format_answer(quiz)
-            + "\n\n次の問題は「問題」と送ってください。"
+        if session["current_quiz"] is None:
+            send_reply(
+                event.reply_token,
+                "まだ問題が出題されていません。\nまずは「問題」と送ってください。"
+            )
+            return
+
+        user_answer = int(user_text)
+        current_quiz = session["current_quiz"]
+
+        if user_answer == current_quiz["answer"]:
+            session["correct_count"] += 1
+
+        result_message = format_result_message(current_quiz, user_answer)
+
+        total = session["question_count"]
+        correct = session["correct_count"]
+
+        # 回答後は current_quiz を空にする
+        session["current_quiz"] = None
+
+        send_reply(
+            event.reply_token,
+            result_message
+            + f"\n\n【現在の成績】\n{correct} / {total} 問正解"
+            + "\n\n次の問題は「問題」または「次」と送ってください。"
         )
+        return
+
+    # ----------------------------
+    # スコア表示
+    # ----------------------------
+    if normalized in ["スコア", "score", "成績"]:
+        total = session["question_count"]
+        correct = session["correct_count"]
+        unanswered = 1 if session["current_quiz"] is not None else 0
+
+        message = (
+            "【現在の成績】\n"
+            f"正解数：{correct}\n"
+            f"出題数：{total}\n"
+        )
+
+        if unanswered:
+            message += "\n未回答の問題が1問あります。"
+
         send_reply(event.reply_token, message)
         return
 
-    help_message = (
-        "AIパスポート問題botです。\n\n"
-        "使い方：\n"
-        "・「問題」→ ランダムで1問出題\n"
-        "・「次」→ 次の問題を出題\n"
-        "・「1」「2」「3」「4」→ 回答番号を送信\n\n"
-        "まずは「問題」と送ってください。"
-    )
-    send_reply(event.reply_token, help_message)
+    # ----------------------------
+    # リセット
+    # ----------------------------
+    if normalized in ["リセット", "reset", "初期化"]:
+        user_sessions[user_id] = {
+            "current_quiz": None,
+            "question_count": 0,
+            "correct_count": 0,
+        }
+        send_reply(event.reply_token, "成績をリセットしました。\n「問題」と送ると再開できます。")
+        return
+
+    # ----------------------------
+    # ヘルプ
+    # ----------------------------
+    if normalized in ["ヘルプ", "help", "使い方"]:
+        send_reply(event.reply_token, get_help_message())
+        return
+
+    # ----------------------------
+    # その他
+    # ----------------------------
+    send_reply(event.reply_token, get_help_message())
 
 
 if __name__ == "__main__":
